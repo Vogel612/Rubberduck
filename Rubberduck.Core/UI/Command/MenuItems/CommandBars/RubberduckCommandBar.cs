@@ -62,62 +62,50 @@ namespace Rubberduck.UI.Command.MenuItems.CommandBars
 
         private async void OnSelectionChange(object sender, DeclarationChangedEventArgs e)
         {
-            try
+            using (var threadLocalSource = new CancellationTokenSource())
             {
-                try
-                {
-                    if (_tokenSources.TryRemove(nameof(OnSelectionChange), out var existing))
+                lock (_tokenSources) {
+                    if (_tokenSources.ContainsKey(nameof(OnSelectionChange)))
+                        && _tokenSources.TryRemove(nameof(OnSelectionChange), out var existing))
                     {
-                        existing.Cancel();
+                        if (!existing.IsCancellationRequested)
+                        {
+                            // only need to cancel, because every invocation of this disposes its own CTS
+                            existing.Cancel();
+                        }
+                    }
+                    _tokenSources.Add(nameof(OnSelectionChange), threadLocalSource);
+                }
+
+                var token = threadLocalSource.Token;
+
+                var caption = await _formatter.FormatAsync(e.Declaration, e.MultipleControlsSelected, token);
+                token.ThrowIfCancellationRequested();
+
+                var argRefCount = e.Declaration is ParameterDeclaration parameter ? parameter.ArgumentReferences.Count() : 0;
+                var refCount = (e.Declaration?.References.Count() ?? 0) + argRefCount;
+                var description = e.Declaration?.DescriptionString.Trim() ?? string.Empty;
+                token.ThrowIfCancellationRequested();
+
+                //& renders the next character as if it was an accelerator.
+                SetContextSelectionCaption(caption?.Replace("&", "&&"), refCount, description);
+                token.ThrowIfCancellationRequested();
+
+                await EvaluateCanExecuteAsync(_state, e.Declaration, token);
+                lock (_tokenSources)
+                {
+                    // check whether the source has been removed via the proxy of its cancellation
+                    //  which is valid thanks to the lock on _tokenSources
+                    if (!threadLocalSource.IsCancellationRequested)
+                    {
+                        // Remove the CTS from the holder because we are done now
+                        _tokenSources.TryRemove(nameof(OnSelectionChange), out var _);
                     }
                 }
-                catch (ObjectDisposedException)
-                {
-                    Logger.Trace($"CancellationTokenSource was already disposed for {nameof(OnSelectionChange)}.");
-                }
-
-                var source = _tokenSources.GetOrAdd(nameof(OnSelectionChange), k => new CancellationTokenSource());
-                var token = source.Token;
-
-                Task.Run(async () =>
-                    {
-                        var caption = await _formatter.FormatAsync(e.Declaration, e.MultipleControlsSelected, token);
-                        token.ThrowIfCancellationRequested();
-
-                        var argRefCount = e.Declaration is ParameterDeclaration parameter ? parameter.ArgumentReferences.Count() : 0;
-                        var refCount = (e.Declaration?.References.Count() ?? 0) + argRefCount;
-                        var description = e.Declaration?.DescriptionString.Trim() ?? string.Empty;
-                        token.ThrowIfCancellationRequested();
-
-                        //& renders the next character as if it was an accelerator.
-                        SetContextSelectionCaption(caption?.Replace("&", "&&"), refCount, description);
-                        token.ThrowIfCancellationRequested();
-
-                        await EvaluateCanExecuteAsync(_state, e.Declaration, token);
-
-                    }, token)
-                    .ContinueWith(t =>
-                    {
-                        try
-                        {
-                            if (!t.IsCanceled)
-                            {
-                                source.Dispose();
-                            }
-                        }
-                        catch (Exception exception)
-                        {
-                            Logger.Trace($"CancellationTokenSource.Dispose() threw an exception for {nameof(OnSelectionChange)}: {exception}");
-                        }
-                    }, token);
-            }
-            catch(ObjectDisposedException)
-            {
-                Logger.Trace($"CancellationTokenSource was already disposed for {nameof(OnSelectionChange)}.");
             }
             catch (OperationCanceledException exception)
             {
-                Logger.Info(exception);
+                Logger.Debug("Cancelled a Command Bar update from Selection Change", exception);
             }
             catch (Exception exception)
             {
